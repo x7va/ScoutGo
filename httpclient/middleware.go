@@ -3,111 +3,23 @@ package httpclient
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // MiddlewareConfig holds configuration for response handling and rate limiting.
 type MiddlewareConfig struct {
-	SuccessStatusCodes   []int         // HTTP status codes considered successful (default: 200)
-	MaxErrorRate         int           // Maximum errors per minute before throttling
-	RateLimitBackoff     time.Duration // Default backoff when no Retry-After is provided
-	EnableAutoRotation   bool          // Automatically rotate proxy/token on rate limits
-	StopOnSuccess        bool          // Stop execution on first success
-	SuccessIdentifierKey string        // JSON key to extract identifier from response (optional)
-}
-
-// ResponseHandler defines the interface for handling HTTP responses.
-type ResponseHandler interface {
-	HandleSuccess(resp *http.Response, body []byte) (identifier string, shouldStop bool)
-	HandleRateLimit(resp *http.Response, proxy string) (delay time.Duration, shouldRotate bool)
-	HandleError(statusCode int, err error) (shouldContinue bool)
-}
-
-// ErrorTracker tracks error frequency to prevent permanent blocks.
-type ErrorTracker struct {
-	errorCount    uint64         // Total error count
-	errorCounts   map[int]uint64 // Error counts by status code
-	lastResetTime time.Time
-	mu            sync.RWMutex
-	windowSize    time.Duration // Time window for error rate calculation
-}
-
-// NewErrorTracker creates a new error tracker with the specified window size.
-func NewErrorTracker(windowSize time.Duration) *ErrorTracker {
-	return &ErrorTracker{
-		errorCounts:   make(map[int]uint64),
-		lastResetTime: time.Now(),
-		windowSize:    windowSize,
-	}
-}
-
-// RecordError records an error with the given status code.
-func (et *ErrorTracker) RecordError(statusCode int) {
-	et.mu.Lock()
-	defer et.mu.Unlock()
-
-	atomic.AddUint64(&et.errorCount, 1)
-	et.errorCounts[statusCode]++
-
-	// Reset if window has expired
-	if time.Since(et.lastResetTime) > et.windowSize {
-		et.reset()
-	}
-}
-
-// reset clears error counts and resets the timer.
-func (et *ErrorTracker) reset() {
-	et.errorCount = 0
-	et.errorCounts = make(map[int]uint64)
-	et.lastResetTime = time.Now()
-}
-
-// GetErrorRate returns the current error rate (errors per minute).
-func (et *ErrorTracker) GetErrorRate() float64 {
-	et.mu.RLock()
-	defer et.mu.RUnlock()
-
-	if time.Since(et.lastResetTime) == 0 {
-		return 0
-	}
-
-	elapsed := time.Since(et.lastResetTime).Minutes()
-	if elapsed == 0 {
-		return 0
-	}
-
-	return float64(atomic.LoadUint64(&et.errorCount)) / elapsed
-}
-
-// GetErrorCounts returns a copy of the error counts by status code.
-func (et *ErrorTracker) GetErrorCounts() map[int]uint64 {
-	et.mu.RLock()
-	defer et.mu.RUnlock()
-
-	counts := make(map[int]uint64)
-	for code, count := range et.errorCounts {
-		counts[code] = count
-	}
-	return counts
-}
-
-// IsRateLimitExceeded checks if the error rate exceeds the threshold.
-func (et *ErrorTracker) IsRateLimitExceeded(threshold int) bool {
-	return et.GetErrorRate() > float64(threshold)
+	SuccessStatusCodes []int         // HTTP status codes considered successful (default: 200)
+	RateLimitBackoff   time.Duration // Default backoff when no Retry-After is provided
+	EnableAutoRotation bool          // Automatically rotate proxy/token on rate limits
+	StopOnSuccess      bool          // Stop execution on first success
 }
 
 // Middleware implements response handling and rate limiting logic.
 type Middleware struct {
-	config       MiddlewareConfig
-	errorTracker *ErrorTracker
-	rotator      *Rotator
-	mu           sync.Mutex
+	config  MiddlewareConfig
+	rotator *Rotator
 }
 
 // NewMiddleware creates a new middleware instance with the given configuration.
@@ -120,25 +32,21 @@ func NewMiddleware(config MiddlewareConfig, rotator *Rotator) *Middleware {
 	}
 
 	return &Middleware{
-		config:       config,
-		errorTracker: NewErrorTracker(1 * time.Minute), // 1-minute window
-		rotator:      rotator,
+		config:  config,
+		rotator: rotator,
 	}
 }
 
 // HandleSuccess processes successful responses and determines if execution should stop.
-// It logs the claimed identifier if configured and returns whether to stop execution.
 func (m *Middleware) HandleSuccess(resp *http.Response, body []byte) (identifier string, shouldStop bool) {
 	statusCode := resp.StatusCode
 
-	// For Discord username checking, parse the JSON response to check "taken" field
-	// Python code doesn't check status codes for this - it processes JSON regardless
-	if len(body) > 0 {
+	// Only process valid JSON responses for Discord username checking
+	if len(body) > 0 && statusCode >= 200 && statusCode < 300 {
 		var discordResponse map[string]interface{}
 		if err := json.Unmarshal(body, &discordResponse); err == nil {
-			// EXACT logic from working x7va JavaScript checker:
 			// taken defaults to true if field is missing
-			var taken bool = true // Default to taken (safer)
+			var taken bool = true
 			if takenField, exists := discordResponse["taken"]; exists {
 				if takenBool, ok := takenField.(bool); ok {
 					taken = takenBool
@@ -148,37 +56,24 @@ func (m *Middleware) HandleSuccess(resp *http.Response, body []byte) (identifier
 			available := !taken
 
 			if available {
-				// Username is available (taken = false or missing)
 				return "available", m.config.StopOnSuccess
 			} else {
-				// Username is taken (taken = true)
 				return "taken", false
 			}
-		} else {
-			return "error", false
 		}
 	}
 
-	// Fallback to original behavior for non-Discord responses
-	// Check if this is a success status code
+	// Fallback for non-Discord responses
 	for _, code := range m.config.SuccessStatusCodes {
 		if statusCode == code {
-			if m.config.SuccessIdentifierKey != "" && len(body) > 0 {
-				identifier = m.extractIdentifier(body, m.config.SuccessIdentifierKey)
-			} else {
-				identifier = fmt.Sprintf("status_%d", statusCode)
-			}
-
-			return identifier, m.config.StopOnSuccess
+			return fmt.Sprintf("status_%d", statusCode), m.config.StopOnSuccess
 		}
 	}
 
-	// Return empty identifier for non-success status codes
 	return "", false
 }
 
 // HandleRateLimit processes rate limit responses (429) and Retry-After headers.
-// It parses the delay value and determines if proxy/token rotation should occur.
 func (m *Middleware) HandleRateLimit(resp *http.Response, proxy string) (delay time.Duration, shouldRotate bool) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		return 0, false
@@ -187,11 +82,9 @@ func (m *Middleware) HandleRateLimit(resp *http.Response, proxy string) (delay t
 	// Parse Retry-After header
 	retryAfter := resp.Header.Get("Retry-After")
 	if retryAfter != "" {
-		// Retry-After can be either seconds (number) or HTTP date
 		if seconds, err := strconv.Atoi(retryAfter); err == nil {
 			delay = time.Duration(seconds) * time.Second
 		} else {
-			// Try parsing as HTTP date
 			if retryTime, err := http.ParseTime(retryAfter); err == nil {
 				delay = time.Until(retryTime)
 				if delay < 0 {
@@ -202,126 +95,56 @@ func (m *Middleware) HandleRateLimit(resp *http.Response, proxy string) (delay t
 			}
 		}
 	} else {
-		// No Retry-After header, use default backoff
 		delay = m.config.RateLimitBackoff
 	}
 
-	// Ensure minimum delay of 1 second for timer display
+	// Ensure minimum delay
 	if delay < 1*time.Second {
-		delay = 5 * time.Second // Use default if delay is too short
+		delay = 5 * time.Second
 	}
 
-	// Mark proxy as rate-limited with cooldown
+	// Mark proxy as rate-limited
 	if m.rotator != nil && proxy != "" && proxy != "direct" {
 		m.rotator.MarkProxyRateLimited(proxy, delay)
 	}
 
-	// Record the rate limit error
-	m.errorTracker.RecordError(http.StatusTooManyRequests)
-
-	// Determine if rotation should occur
 	shouldRotate = m.config.EnableAutoRotation
-
 	return delay, shouldRotate
 }
 
-// HandleError processes error responses and determines if execution should continue.
-// It tracks error frequency and enforces safe thresholds.
-func (m *Middleware) HandleError(statusCode int, err error) (shouldContinue bool) {
-	// Record the error
-	m.errorTracker.RecordError(statusCode)
-
-	// Check if error rate exceeds threshold (but don't stop execution, just warn)
-	if m.config.MaxErrorRate > 0 && m.errorTracker.IsRateLimitExceeded(m.config.MaxErrorRate) {
-		// Don't stop execution - continue despite high error rate
-	}
-
-	// Always continue execution - let user decide when to stop
-	return true
-}
-
-// extractIdentifier attempts to extract a value from JSON body using a key path.
-// This is a simple implementation; for complex JSON, consider using a JSON parser.
-func (m *Middleware) extractIdentifier(body []byte, key string) string {
-	bodyStr := string(body)
-
-	// This is a basic implementation - for production use, use encoding/json
-	// Find the pattern in the body
-	if idx := strings.Index(bodyStr, `"`+key+`"`); idx != -1 {
-		// Look for the value after the key
-		start := idx + len(key) + 3 // Skip past "key":
-		if start < len(bodyStr) {
-			// Find the closing quote
-			if end := strings.Index(bodyStr[start:], `"`); end != -1 {
-				return bodyStr[start : start+end]
-			}
-		}
-	}
-
-	return fmt.Sprintf("response_%d", len(body))
-}
-
 // RotateCredentials forces a rotation of proxy and token.
-// This is called when rate limiting is detected to use fresh credentials.
 func (m *Middleware) RotateCredentials() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.rotator != nil {
-		// Rotate to next proxy and token
 		m.rotator.NextProxy()
 		m.rotator.NextToken()
 	}
 }
 
 // ProcessResponse is the main entry point for middleware response processing.
-// It handles success, rate limits, and errors in a single call.
 func (m *Middleware) ProcessResponse(resp *http.Response, body []byte, err error, proxy string) (identifier string, shouldStop bool, shouldRotate bool, delay time.Duration) {
 	if err != nil {
-		// Handle request error
-		shouldContinue := m.HandleError(0, err)
-		return "", !shouldContinue, false, 0
+		return "", false, false, 0
 	}
 
 	statusCode := resp.StatusCode
 
-	// Check for rate limit FIRST (like Python code)
+	// Check for rate limit FIRST
 	if statusCode == http.StatusTooManyRequests {
 		delay, shouldRotate := m.HandleRateLimit(resp, proxy)
 		return "", false, shouldRotate, delay
 	}
 
-	// Process Discord username response regardless of status code
-	// Python code processes JSON response for username checking regardless of status
+	// Process Discord username response
 	identifier, shouldStopSuccess := m.HandleSuccess(resp, body)
 
 	if identifier != "" {
-		// If we got an identifier (available, taken, or error), use it
 		return identifier, shouldStopSuccess, false, 0
 	}
 
-	// Handle other error status codes (if not already handled above)
+	// Handle other error status codes
 	if statusCode >= 400 {
-		shouldContinue := m.HandleError(statusCode, nil)
-		return "", !shouldContinue, false, 0
+		return "", false, false, 0
 	}
 
-	// Non-success, non-error response (e.g., 3xx redirects)
 	return "", false, false, 0
-}
-
-// GetErrorStats returns current error tracking statistics.
-func (m *Middleware) GetErrorStats() map[string]interface{} {
-	return map[string]interface{}{
-		"total_errors":       atomic.LoadUint64(&m.errorTracker.errorCount),
-		"error_rate_per_min": m.errorTracker.GetErrorRate(),
-		"error_counts":       m.errorTracker.GetErrorCounts(),
-		"window_size":        m.errorTracker.windowSize,
-	}
-}
-
-// ResetErrorTracking clears all error tracking data.
-func (m *Middleware) ResetErrorTracking() {
-	m.errorTracker.reset()
-	log.Println("Error tracking reset")
 }

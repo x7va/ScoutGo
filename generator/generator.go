@@ -13,13 +13,13 @@ const (
 	combinationLength = 4
 )
 
-// GenerateTargets generates all possible 4-character combinations and writes them to targets.txt
+// GenerateTargets generates all possible 4-character combinations and writes them to data/targets.txt
 func GenerateTargets() {
 	// Generate all possible 4-character combinations
 	combinations := generateCombinations(charset, combinationLength)
 
-	// Write combinations to targets.txt
-	filename := "targets.txt"
+	// Write combinations to data/targets.txt
+	filename := "data/targets.txt"
 	count, err := writeCombinationsToFile(combinations, filename)
 	if err != nil {
 		log.Fatalf("Failed to write combinations to file: %v", err)
@@ -55,6 +55,11 @@ func generateHelper(chars string, length int, current string, result *[]string) 
 
 // writeCombinationsToFile writes the combinations to a file, one per line.
 func writeCombinationsToFile(combinations []string, filename string) (int, error) {
+	// Create data directory if it doesn't exist
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return 0, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
 	file, err := os.Create(filename)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create file: %w", err)

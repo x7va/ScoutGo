@@ -1,7 +1,7 @@
 package main
 
 import (
-	"sniper/generator"
+	"scoutgo/generator"
 )
 
 func main() {

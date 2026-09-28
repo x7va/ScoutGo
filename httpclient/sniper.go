@@ -1,5 +1,7 @@
 package httpclient
 
+// ScoutGo HTTP Client - By @x7va
+
 import (
 	"bufio"
 	"bytes"
@@ -49,7 +51,6 @@ type Sniper struct {
 	resultsChan chan Result
 	wg          sync.WaitGroup
 	middleware  *Middleware
-	dashboard   *Dashboard
 	metrics     *DashboardMetrics
 	baseURL     string // Base URL for constructing full target URLs
 	useProxies  bool   // Whether proxies are being used
@@ -76,7 +77,6 @@ func NewSniper(config SniperConfig, rotator *Rotator) *Sniper {
 	if config.Middleware == nil {
 		middleware = NewMiddleware(MiddlewareConfig{
 			SuccessStatusCodes: []int{200},
-			MaxErrorRate:       60, // 60 errors per minute
 			RateLimitBackoff:   5 * time.Second,
 			EnableAutoRotation: true,
 			StopOnSuccess:      false,
@@ -85,9 +85,8 @@ func NewSniper(config SniperConfig, rotator *Rotator) *Sniper {
 		middleware = config.Middleware
 	}
 
-	// Initialize metrics and dashboard
+	// Initialize metrics
 	metrics := &DashboardMetrics{}
-	dashboard := NewDashboard(metrics)
 
 	return &Sniper{
 		config:      config,
@@ -95,16 +94,20 @@ func NewSniper(config SniperConfig, rotator *Rotator) *Sniper {
 		workers:     config.WorkerCount,
 		resultsChan: make(chan Result, config.WorkerCount*2), // Buffered channel
 		middleware:  middleware,
-		dashboard:   dashboard,
 		metrics:     metrics,
 		baseURL:     config.BaseURL,
 		useProxies:  true, // Will be set based on actual proxy availability
 	}
 }
 
-// LoadTargets reads target URLs from a file (targets.txt).
+// SetTargets directly sets the targets from a slice (for random username generation)
+func (s *Sniper) SetTargets(targets []string) {
+	s.targets = targets
+}
+
+// LoadTargets reads target URLs from a file (data/targets.txt or data/names_to_check.txt).
 // Each line should contain a single target URL or endpoint.
-// Empty lines and lines starting with # are ignored.
+// Empty lines and lines starting with # or // are ignored.
 func (s *Sniper) LoadTargets(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -117,7 +120,7 @@ func (s *Sniper) LoadTargets(filename string) error {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 			continue
 		}
 		targets = append(targets, line)
@@ -133,11 +136,6 @@ func (s *Sniper) LoadTargets(filename string) error {
 
 	s.targets = targets
 	return nil
-}
-
-// SetTargets directly sets the targets from a slice (for random username generation)
-func (s *Sniper) SetTargets(targets []string) {
-	s.targets = targets
 }
 
 // SetProxyUsage sets whether proxies are being used
@@ -160,12 +158,6 @@ func (s *Sniper) Execute() {
 		return
 	}
 
-	PrintStatus("Starting execution with %d workers for %d targets", s.workers, len(s.targets))
-
-	// Disable dashboard to prevent overlapping text
-	// s.dashboard.Start(100 * time.Millisecond)
-	// defer s.dashboard.Stop()
-
 	// Create a buffered channel for targets
 	targetChan := make(chan string, s.workers)
 
@@ -187,7 +179,6 @@ func (s *Sniper) Execute() {
 	go func() {
 		s.wg.Wait()
 		close(s.resultsChan)
-		PrintStatus("Execution completed")
 	}()
 }
 
@@ -214,6 +205,8 @@ func (s *Sniper) worker(targetChan <-chan string, workerID int) {
 			if result.Identifier == "available" {
 				s.metrics.IncrementAvailableStatus()
 				s.metrics.IncrementSuccessfulClaims()
+				// Save hit to results/hits.txt
+				saveHit(result.Target)
 				// Format: [Available] username RPS: X/s | resp: {'taken': False} | proxy: address
 				elapsed := time.Since(s.metrics.StartTime)
 				var rps float64
@@ -226,7 +219,7 @@ func (s *Sniper) worker(targetChan <-chan string, workerID int) {
 				} else if len(proxyAddr) > 30 {
 					proxyAddr = proxyAddr[:30]
 				}
-				fmt.Printf("%sAvailable%s %s, RPS : %.0f / s, resp : {'taken': False}, proxy : %s\n", Green, Reset, result.Target, rps, proxyAddr)
+				fmt.Printf("%s[Available]%s %s, RPS : %.0f / s, resp : {'taken': False}, proxy : %s\n", "\033[32m", "\033[0m", result.Target, rps, proxyAddr)
 			} else if result.Identifier == "taken" {
 				// Format: [Taken] username RPS: X/s | resp: {'taken': True} | proxy: address
 				elapsed := time.Since(s.metrics.StartTime)
@@ -240,60 +233,30 @@ func (s *Sniper) worker(targetChan <-chan string, workerID int) {
 				} else if len(proxyAddr) > 30 {
 					proxyAddr = proxyAddr[:30]
 				}
-				fmt.Printf("%sTaken%s %s, RPS : %.0f / s, resp : {'taken': True}, proxy : %s\n", Red, Reset, result.Target, rps, proxyAddr)
+				fmt.Printf("%s[Taken]%s %s, RPS : %.0f / s, resp : {'taken': True}, proxy : %s\n", "\033[31m", "\033[0m", result.Target, rps, proxyAddr)
+				s.metrics.IncrementTakenStatus()
 			} else if result.Identifier == "error" {
-				// Discord returned an error response
 				s.metrics.IncrementErrors()
-				PrintError("Discord API error on @%s", result.Target)
 			} else if result.Status == 429 {
-				// Check for rate limits
 				s.metrics.IncrementRateLimits()
-
-				// Print initial rate limit message
-				proxyAddr := result.Proxy
-				if len(proxyAddr) > 30 {
-					proxyAddr = proxyAddr[:30]
-				}
-				delaySeconds := int(result.Delay.Seconds())
-				if delaySeconds < 1 {
-					delaySeconds = 5 // Ensure minimum delay
-				}
-				PrintRateLimit("Rate limited on @%s - back in %ds (proxy: %s)", result.Target, delaySeconds, proxyAddr)
-
 				// Track rate limit with timer manager using unique ID
 				s.rotator.TrackRateLimit(result.Target, result.Proxy, result.Delay, 0)
 			} else if result.Status >= 200 && result.Status < 300 {
-				// Generic success response for non-Discord APIs
 				s.metrics.IncrementAvailableStatus()
 				if result.Identifier != "" {
 					s.metrics.IncrementSuccessfulClaims()
-					PrintSuccess("@%s claimed by @%s", result.Target, TruncateToken(result.Token, 10))
-				} else {
-					PrintAvailability("@%s is FREE! Dispatching claim", result.Target)
 				}
 			} else {
-				// Other HTTP errors
 				s.metrics.IncrementErrors()
-				PrintError("HTTP %d on @%s", result.Status, result.Target)
 			}
 		} else {
 			s.metrics.IncrementErrors()
-			// Distinguish between proxy errors, rate limits, and other errors
+			// Mark proxy as failed on errors
 			errMsg := result.Error.Error()
-			if strings.Contains(errMsg, "proxy") || strings.Contains(errMsg, "socks") || strings.Contains(errMsg, "connect") {
-				PrintError("Proxy error: %v", result.Error)
-				// Mark proxy as failed
+			if strings.Contains(errMsg, "proxy") || strings.Contains(errMsg, "socks") || strings.Contains(errMsg, "connect") || strings.Contains(errMsg, "timeout") {
 				if s.rotator != nil && result.Proxy != "" && result.Proxy != "direct" {
 					s.rotator.MarkProxyFailed(result.Proxy)
 				}
-			} else if strings.Contains(errMsg, "timeout") {
-				PrintError("Timeout: %v", result.Error)
-				// Mark proxy as failed (timeouts indicate bad proxy)
-				if s.rotator != nil && result.Proxy != "" && result.Proxy != "direct" {
-					s.rotator.MarkProxyFailed(result.Proxy)
-				}
-			} else {
-				PrintError("Request failed: %v", result.Error)
 			}
 		}
 
@@ -318,27 +281,25 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 		}
 	}
 
-	// Use base URL (Discord endpoint is fixed: https://discord.com/api/v9/users/@me)
+	// Use base URL
 	fullURL := s.baseURL
 	if fullURL == "" {
-		fullURL = target // Fallback to target if no base URL
+		fullURL = target
 	}
 
 	// Prepare request body with username for Discord
 	var body io.Reader
 	if s.config.JSONPayload != nil && (s.config.HTTPMethod == "POST" || s.config.HTTPMethod == "PATCH" || s.config.HTTPMethod == "PUT") {
-		// Deep copy payload and inject target username
 		payloadCopy := make(map[string]interface{})
 		if pv, ok := s.config.JSONPayload.(map[string]interface{}); ok {
 			for k, v := range pv {
 				if strVal, isStr := v.(string); isStr && strVal == "TARGET_PLACEHOLDER" {
-					payloadCopy[k] = target // Inject username
+					payloadCopy[k] = target
 				} else {
 					payloadCopy[k] = v
 				}
 			}
 		} else {
-			// If payload is not a map, use target as username
 			payloadCopy["username"] = target
 		}
 
@@ -366,20 +327,17 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 		}
 	}
 
-	// Set headers - match working x7va JavaScript code exactly
-	// Only set Authorization if using authenticated endpoint
+	// Set headers
 	if token != "" && !strings.Contains(s.baseURL, "unauthed") {
 		req.Header.Set("Authorization", token)
 	}
-	// Set Content-Type to match x7va code (lowercase)
 	req.Header.Set("Content-Type", "application/json")
-	// Set User-Agent to match x7va code
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 	for key, value := range s.config.Headers {
 		req.Header.Set(key, value)
 	}
 
-	// Set timeout for this specific request
+	// Set timeout
 	client.Timeout = s.config.RequestTimeout
 
 	// Execute request
@@ -387,12 +345,6 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 	latency := time.Since(startTime)
 
 	if err != nil {
-		// Process error through middleware
-		if s.middleware != nil {
-			_, shouldStop, _, _ := s.middleware.ProcessResponse(nil, nil, err, proxy)
-			if shouldStop {
-			}
-		}
 		return Result{
 			Target:  target,
 			Status:  0,
@@ -402,7 +354,7 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 	}
 	defer resp.Body.Close()
 
-	// Read response body for middleware processing
+	// Read response body
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		responseBody = []byte{}
@@ -417,8 +369,13 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 		identifier, _, shouldRotate, delay = s.middleware.ProcessResponse(resp, responseBody, nil, proxy)
 	}
 
-	// Create result immediately with identifier to prevent loss during delays
-	result := Result{
+	// Rotate credentials if requested
+	if shouldRotate {
+		s.middleware.RotateCredentials()
+		s.metrics.IncrementProxySwitches()
+	}
+
+	return Result{
 		Target:     target,
 		Status:     resp.StatusCode,
 		Latency:    latency,
@@ -428,14 +385,6 @@ func (s *Sniper) executeRequest(target string, workerID int) Result {
 		Identifier: identifier,
 		Delay:      delay,
 	}
-
-	// Rotate credentials if requested (after result is created)
-	if shouldRotate {
-		s.middleware.RotateCredentials()
-		s.metrics.IncrementProxySwitches()
-	}
-
-	return result
 }
 
 // TruncateToken returns a truncated version of the token for logging purposes.
@@ -451,86 +400,18 @@ func TruncateToken(token string, maxLen int) string {
 	return token[:maxLen] + "..."
 }
 
-// ExecuteWithCallback executes the sniper and calls a callback function for each result.
-// This provides a convenient way to handle results without managing the channel directly.
-func (s *Sniper) ExecuteWithCallback(callback func(Result)) {
-	// Start execution in a goroutine
-	go s.Execute()
-
-	// Process results as they come in
-	for result := range s.Results() {
-		callback(result)
-	}
-}
-
-// ExecuteAndWait executes the sniper and collects all results into a slice.
-// This blocks until all requests are complete and returns all results.
-func (s *Sniper) ExecuteAndWait() []Result {
-	var results []Result
-	var mu sync.Mutex
-
-	// Start execution in a goroutine
-	go s.Execute()
-
-	// Collect results with mutex protection
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for result := range s.Results() {
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-		}
-	}()
-
-	// Wait for all results to be collected
-	wg.Wait()
-	return results
-}
-
-// GetStats returns statistics about the execution results.
-// This should be called after ExecuteAndWait() completes.
-func GetStats(results []Result) map[string]interface{} {
-	if len(results) == 0 {
-		return map[string]interface{}{
-			"total":       0,
-			"success":     0,
-			"failed":      0,
-			"avg_latency": 0,
-		}
+// saveHit saves a successful username hit to results/hits.txt
+func saveHit(username string) error {
+	if err := os.MkdirAll("results", 0755); err != nil {
+		return err
 	}
 
-	successCount := 0
-	failedCount := 0
-	totalLatency := time.Duration(0)
-	statusCodes := make(map[int]int)
-
-	for _, result := range results {
-		if result.Error == nil && result.Status >= 200 && result.Status < 300 {
-			successCount++
-		} else {
-			failedCount++
-		}
-		totalLatency += result.Latency
-		statusCodes[result.Status]++
+	file, err := os.OpenFile("results/hits.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
 	}
+	defer file.Close()
 
-	avgLatency := totalLatency / time.Duration(len(results))
-
-	return map[string]interface{}{
-		"total":        len(results),
-		"success":      successCount,
-		"failed":       failedCount,
-		"avg_latency":  avgLatency.Milliseconds(),
-		"status_codes": statusCodes,
-	}
-}
-
-// GetMetrics returns the dashboard metrics snapshot for the sniper.
-func (s *Sniper) GetMetrics() map[string]interface{} {
-	if s.metrics == nil {
-		return nil
-	}
-	return s.metrics.GetSnapshot()
+	_, err = file.WriteString(username + "\n")
+	return err
 }

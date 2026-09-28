@@ -25,6 +25,7 @@ const (
 type DashboardMetrics struct {
 	TotalChecks      atomic.Uint64 // Total requests attempted
 	AvailableStatus  atomic.Uint64 // Available targets (200 OK)
+	TakenStatus      atomic.Uint64 // Taken targets
 	SuccessfulClaims atomic.Uint64 // Successful claims with identifiers
 	Errors           atomic.Uint64 // Total errors encountered
 	RateLimits       atomic.Uint64 // Rate limit responses (429)
@@ -210,95 +211,6 @@ func MoveDown(lines int) {
 	fmt.Printf("\033[%dB", lines)
 }
 
-// SaveCursor saves the current cursor position.
-func SaveCursor() {
-	fmt.Print("\033[s")
-}
-
-// RestoreCursor restores the saved cursor position.
-func RestoreCursor() {
-	fmt.Print("\033[u")
-}
-
-// HideCursor hides the cursor (useful for animations).
-func HideCursor() {
-	fmt.Print("\033[?25l")
-}
-
-// ShowCursor shows the cursor again.
-func ShowCursor() {
-	fmt.Print("\033[?25h")
-}
-
-// ClearScreen clears the entire terminal screen.
-func ClearScreen() {
-	fmt.Print("\033[2J")
-	fmt.Print("\033[H")
-}
-
-// PrintHeader prints a formatted header section.
-func PrintHeader(title string) {
-	width := 60
-	border := strings.Repeat("═", width)
-	padding := (width - len(title)) / 2
-	if padding < 0 {
-		padding = 0
-	}
-
-	fmt.Printf("%s%s\n", Cyan, border)
-	fmt.Printf("%s%s%s%s%s\n", Cyan, strings.Repeat(" ", padding), Bold, title, Reset+Cyan)
-	fmt.Printf("%s%s\n\n", Cyan, border)
-}
-
-// PrintSection prints a section divider.
-func PrintSection(title string) {
-	fmt.Printf("\n%s%s%s\n", Bold, title, Reset)
-	fmt.Printf("%s\n", strings.Repeat("─", len(title)))
-}
-
-// PrintTable prints a simple formatted table.
-func PrintTable(headers []string, rows [][]string) {
-	if len(headers) == 0 || len(rows) == 0 {
-		return
-	}
-
-	// Calculate column widths
-	colWidths := make([]int, len(headers))
-	for i, header := range headers {
-		colWidths[i] = len(header)
-	}
-	for _, row := range rows {
-		for i, cell := range row {
-			if len(cell) > colWidths[i] {
-				colWidths[i] = len(cell)
-			}
-		}
-	}
-
-	// Print header
-	headerLine := ""
-	for i, header := range headers {
-		headerLine += fmt.Sprintf("%-*s", colWidths[i]+2, header)
-	}
-	fmt.Printf("%s%s%s\n", Bold+Cyan, headerLine, Reset)
-
-	// Print separator
-	separator := ""
-	for _, width := range colWidths {
-		separator += strings.Repeat("─", width+2) + " "
-	}
-	fmt.Printf("%s%s\n", Cyan, separator)
-
-	// Print rows
-	for _, row := range rows {
-		rowLine := ""
-		for i, cell := range row {
-			rowLine += fmt.Sprintf("%-*s", colWidths[i]+2, cell)
-		}
-		fmt.Printf("%s\n", rowLine)
-	}
-}
-
 // LogWithTimestamp prints a message with timestamp.
 func LogWithTimestamp(level, format string, args ...interface{}) {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
@@ -321,36 +233,6 @@ func LogWithTimestamp(level, format string, args ...interface{}) {
 	fmt.Printf("%s[%s]%s %s%s\n", White, timestamp, color, msg, Reset)
 }
 
-// FormatNumber formats a number with thousands separators.
-func FormatNumber(n uint64) string {
-	if n < 1000 {
-		return fmt.Sprintf("%d", n)
-	}
-	if n < 1000000 {
-		return fmt.Sprintf("%.1fK", float64(n)/1000)
-	}
-	return fmt.Sprintf("%.1fM", float64(n)/1000000)
-}
-
-// FormatDuration formats a duration in a human-readable way.
-func FormatDuration(d time.Duration) string {
-	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
-	}
-	if d < time.Minute {
-		return fmt.Sprintf("%.1fs", d.Seconds())
-	}
-	if d < time.Hour {
-		return fmt.Sprintf("%.1fm", d.Minutes())
-	}
-	return fmt.Sprintf("%.1fh", d.Hours())
-}
-
-// PrintBanner prints a startup banner.
-func PrintBanner() {
-	fmt.Printf("%s=== SNIPER - High-Performance Username Checker ===%s\n\n", Bold+Cyan, Reset)
-}
-
 // Metrics helper methods for atomic operations
 
 // IncrementTotalChecks increments the total checks counter.
@@ -361,6 +243,11 @@ func (m *DashboardMetrics) IncrementTotalChecks() {
 // IncrementAvailableStatus increments the available status counter.
 func (m *DashboardMetrics) IncrementAvailableStatus() {
 	m.AvailableStatus.Add(1)
+}
+
+// IncrementTakenStatus increments the taken status counter.
+func (m *DashboardMetrics) IncrementTakenStatus() {
+	m.TakenStatus.Add(1)
 }
 
 // IncrementSuccessfulClaims increments the successful claims counter.
@@ -394,6 +281,7 @@ func (m *DashboardMetrics) GetSnapshot() map[string]interface{} {
 	return map[string]interface{}{
 		"total_checks":        m.TotalChecks.Load(),
 		"available_status":    m.AvailableStatus.Load(),
+		"taken_status":        m.TakenStatus.Load(),
 		"successful_claims":   m.SuccessfulClaims.Load(),
 		"errors":              m.Errors.Load(),
 		"rate_limits":         m.RateLimits.Load(),

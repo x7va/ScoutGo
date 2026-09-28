@@ -26,8 +26,8 @@ type RateLimitInfo struct {
 // Rotator manages round-robin distribution of proxies and tokens.
 // It provides thread-safe access to proxy and token pools for high-concurrency scenarios.
 type Rotator struct {
-	proxies          []string                 // List of proxy URLs loaded from proxies.txt
-	tokens           []string                 // List of authorization tokens loaded from tokens.txt
+	proxies          []string                 // List of proxy URLs loaded from data/proxies.txt
+	tokens           []string                 // List of authorization tokens loaded from data/tokens.txt
 	proxyMu          sync.Mutex               // Mutex for thread-safe proxy access
 	tokenMu          sync.Mutex               // Mutex for thread-safe token access
 	proxyIdx         int                      // Current index for round-robin proxy selection
@@ -165,9 +165,6 @@ func loadTokens(filename string) ([]string, error) {
 // Thread-safe using sync.Mutex to prevent race conditions in concurrent scenarios.
 // Returns empty string if no proxies are available.
 func (r *Rotator) NextProxy() string {
-	r.proxyMu.Lock()
-	defer r.proxyMu.Unlock()
-
 	if len(r.proxies) == 0 {
 		return ""
 	}
@@ -177,15 +174,22 @@ func (r *Rotator) NextProxy() string {
 	maxAttempts := len(r.proxies) * 2 // Prevent infinite loop
 
 	for attempts < maxAttempts {
+		// Get proxy with minimal lock holding
+		r.proxyMu.Lock()
+		if len(r.proxies) == 0 {
+			r.proxyMu.Unlock()
+			return ""
+		}
 		proxy := r.proxies[r.proxyIdx]
 		r.proxyIdx = (r.proxyIdx + 1) % len(r.proxies)
+		r.proxyMu.Unlock()
 
 		// Check if proxy has failed too many times
 		r.proxyMuFail.Lock()
 		failures := r.proxyFailures[proxy]
 		r.proxyMuFail.Unlock()
 
-		// Check if proxy is in cooldown (avoid nested locks)
+		// Check if proxy is in cooldown
 		r.cooldownMu.Lock()
 		inCooldown := r.isProxyInCooldownNoLock(proxy)
 		r.cooldownMu.Unlock()
@@ -203,20 +207,6 @@ func (r *Rotator) NextProxy() string {
 	}
 
 	return "" // All proxies failed
-}
-
-// GetCurrentProxy returns the current proxy URL without advancing the index.
-// Thread-safe using sync.Mutex to prevent race conditions in concurrent scenarios.
-// Returns empty string if no proxies are available.
-func (r *Rotator) GetCurrentProxy() string {
-	r.proxyMu.Lock()
-	defer r.proxyMu.Unlock()
-
-	if len(r.proxies) == 0 {
-		return ""
-	}
-
-	return r.proxies[r.proxyIdx]
 }
 
 // NextToken returns the next token in round-robin fashion.
@@ -238,25 +228,25 @@ func (r *Rotator) NextToken() string {
 // GetClientWithProxy returns an http.Client configured with the next proxy from the pool.
 // This uses a cached client for each proxy to maintain connection pooling benefits.
 // If no proxy is available, returns the base client.
-func (r *Rotator) GetClientWithProxy() (*http.Client, error) {
+func (r *Rotator) GetClientWithProxy() (*http.Client, string, error) {
 	proxyURL := r.NextProxy()
 	if proxyURL == "" {
 		// No proxy available, return the base client
-		return GetClient(), nil
+		return GetClient(), "", nil
 	}
 
 	// Check cache first
 	r.cacheMu.RLock()
 	if client, exists := r.clientCache[proxyURL]; exists {
 		r.cacheMu.RUnlock()
-		return client, nil
+		return client, proxyURL, nil
 	}
 	r.cacheMu.RUnlock()
 
 	// Parse the proxy URL
 	proxyURLParsed, err := url.Parse(proxyURL)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Create a new transport with proxy configuration
@@ -269,7 +259,7 @@ func (r *Rotator) GetClientWithProxy() (*http.Client, error) {
 			KeepAlive: 30 * time.Second,
 		})
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return socksDialer.Dial(network, addr)
@@ -290,7 +280,7 @@ func (r *Rotator) GetClientWithProxy() (*http.Client, error) {
 	r.clientCache[proxyURL] = client
 	r.cacheMu.Unlock()
 
-	return client, nil
+	return client, proxyURL, nil
 }
 
 // GetClientWithToken returns the base http.Client along with the next token.
@@ -305,18 +295,15 @@ func (r *Rotator) GetClientWithToken() (*http.Client, string) {
 // and the next token from their respective pools.
 // This combines both rotation mechanisms for requests that need both proxy and auth.
 func (r *Rotator) GetClientWithProxyAndToken() (*http.Client, string, string, error) {
-	// Get the current proxy before advancing (for logging purposes)
-	currentProxy := r.GetCurrentProxy()
-	if currentProxy == "" {
-		currentProxy = "direct"
-	}
-
-	client, err := r.GetClientWithProxy()
+	client, proxyURL, err := r.GetClientWithProxy()
 	if err != nil {
-		return nil, "", currentProxy, err
+		return nil, "", "", err
+	}
+	if proxyURL == "" {
+		proxyURL = "direct"
 	}
 	token := r.NextToken()
-	return client, token, currentProxy, nil
+	return client, token, proxyURL, nil
 }
 
 // ProxyCount returns the number of loaded proxies.
@@ -469,12 +456,7 @@ func (r *Rotator) StopTimerManager() {
 
 	if r.timerRunning {
 		r.timerRunning = false
-		select {
-		case <-r.timerStopChan:
-			// Already closed
-		default:
-			close(r.timerStopChan)
-		}
+		close(r.timerStopChan)
 	}
 }
 
@@ -486,6 +468,7 @@ func (r *Rotator) StartTimerManager() {
 		return
 	}
 	r.timerRunning = true
+	r.timerStopChan = make(chan struct{})
 	r.rateLimitMu.Unlock()
 
 	// Initialize maps if nil
@@ -498,7 +481,7 @@ func (r *Rotator) StartTimerManager() {
 	}
 
 	go func() {
-		ticker := time.NewTicker(1 * time.Second) // Update every 1 second
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		for {
@@ -524,11 +507,7 @@ func (r *Rotator) StartTimerManager() {
 						r.rateLimitMu.Lock()
 						delete(r.activeRateLimits, id)
 						r.rateLimitMu.Unlock()
-						// Print completion message and newline
-						fmt.Printf("%s[RATELIMIT] @%s cooldown complete%s\n", Yellow, info.Target, Reset)
-					} else {
-						// Don't print updates - just track the cooldown
-						// The initial message already shows the time
+						fmt.Printf("%s[RATELIMIT] @%s cooldown complete%s\n", "\033[33m", info.Target, "\033[0m")
 					}
 				}
 			case <-r.timerStopChan:

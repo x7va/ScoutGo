@@ -20,10 +20,29 @@ vendor/
 go.work
 
 # Sensitive files
-tokens.txt
-proxies.txt
-config.json
+data/proxies.txt
+data/config.json
 .env
+data/webhook.txt
+data/tokens.txt
+data/passwords.txt
+data/targets.txt
+
+# ScoutGo data folder
+data/customlist.txt
+data/names_to_check.txt
+
+# Results folder
+results/hits.txt
+results/github_hits.txt
+results/working_proxies.txt
+
+# Logs folder
+logs/
+
+# ScoutGo executable
+ScoutGo
+scoutgo
 
 # IDE files
 .vscode/
