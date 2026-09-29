@@ -207,33 +207,23 @@ func (s *Sniper) worker(targetChan <-chan string, workerID int) {
 				s.metrics.IncrementSuccessfulClaims()
 				// Save hit to results/hits.txt
 				saveHit(result.Target)
-				// Format: [Available] username RPS: X/s | resp: {'taken': False} | proxy: address
-				elapsed := time.Since(s.metrics.StartTime)
-				var rps float64
-				if elapsed.Seconds() > 0 {
-					rps = float64(s.metrics.TotalChecks.Load()) / elapsed.Seconds()
-				}
+				// Format: [Available] username | resp: {'taken': False} | proxy: address
 				proxyAddr := result.Proxy
 				if proxyAddr == "" {
 					proxyAddr = "direct"
 				} else if len(proxyAddr) > 30 {
 					proxyAddr = proxyAddr[:30]
 				}
-				fmt.Printf("%s[Available]%s %s, RPS : %.0f / s, resp : {'taken': False}, proxy : %s\n", "\033[32m", "\033[0m", result.Target, rps, proxyAddr)
+				fmt.Printf("%s[Available]%s %s, resp : {'taken': False}, proxy : %s\n", "\033[32m", "\033[0m", result.Target, proxyAddr)
 			} else if result.Identifier == "taken" {
-				// Format: [Taken] username RPS: X/s | resp: {'taken': True} | proxy: address
-				elapsed := time.Since(s.metrics.StartTime)
-				var rps float64
-				if elapsed.Seconds() > 0 {
-					rps = float64(s.metrics.TotalChecks.Load()) / elapsed.Seconds()
-				}
+				// Format: [Taken] username | resp: {'taken': True} | proxy: address
 				proxyAddr := result.Proxy
 				if proxyAddr == "" {
 					proxyAddr = "direct"
 				} else if len(proxyAddr) > 30 {
 					proxyAddr = proxyAddr[:30]
 				}
-				fmt.Printf("%s[Taken]%s %s, RPS : %.0f / s, resp : {'taken': True}, proxy : %s\n", "\033[31m", "\033[0m", result.Target, rps, proxyAddr)
+				fmt.Printf("%s[Taken]%s %s, resp : {'taken': True}, proxy : %s\n", "\033[38;5;208m", "\033[0m", result.Target, proxyAddr)
 				s.metrics.IncrementTakenStatus()
 			} else if result.Identifier == "error" {
 				s.metrics.IncrementErrors()
@@ -251,13 +241,8 @@ func (s *Sniper) worker(targetChan <-chan string, workerID int) {
 			}
 		} else {
 			s.metrics.IncrementErrors()
-			// Mark proxy as failed on errors
-			errMsg := result.Error.Error()
-			if strings.Contains(errMsg, "proxy") || strings.Contains(errMsg, "socks") || strings.Contains(errMsg, "connect") || strings.Contains(errMsg, "timeout") {
-				if s.rotator != nil && result.Proxy != "" && result.Proxy != "direct" {
-					s.rotator.MarkProxyFailed(result.Proxy)
-				}
-			}
+			// Don't auto-mark proxies as failed on errors - too aggressive
+			// Let the cooldown system handle rate limits naturally
 		}
 
 		s.resultsChan <- result

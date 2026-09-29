@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1133,13 +1134,22 @@ func runClaimMode() {
 
 // runGitHubChecker checks GitHub username availability
 func runGitHubChecker() {
+	reader := bufio.NewReader(os.Stdin)
+
+	readLine := func(prompt string) string {
+		fmt.Print(prompt)
+		line, err := reader.ReadString('\n')
+		if err != nil && len(line) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(line)
+	}
+
 	fmt.Println("\n=== GitHub Username Checker ===")
 	fmt.Println("Checking GitHub username availability using GitHub API")
 
 	// Ask for GitHub token (optional but recommended for higher rate limits)
-	fmt.Print("Enter GitHub personal access token (optional, press Enter to skip): ")
-	var githubToken string
-	fmt.Scanln(&githubToken)
+	githubToken := readLine("Enter GitHub personal access token (optional, press Enter to skip): ")
 
 	if githubToken == "" {
 		fmt.Println("Note: Without a token, you'll be limited to 60 requests/hour from a single IP")
@@ -1147,35 +1157,29 @@ func runGitHubChecker() {
 	}
 
 	// Username generation vs file
-	fmt.Print("Generate random usernames? (y/n): ")
-	var generateUsernames string
-	fmt.Scanln(&generateUsernames)
+	generateUsernames := readLine("Generate random usernames? (y/n): ")
 
 	var usernames []string
-	var usernameCount int
-	var usernameLength int
 
 	if generateUsernames == "y" || generateUsernames == "Y" {
-		fmt.Print("Number of usernames to generate: ")
-		fmt.Scanln(&usernameCount)
-		fmt.Print("Username length (characters, min 1 for GitHub): ")
-		fmt.Scanln(&usernameLength)
-		if usernameLength < 1 {
-			usernameLength = 1 // Minimum for GitHub
-			fmt.Println("Username length set to minimum of 1 for GitHub compatibility")
-		}
-		if usernameLength > 39 {
-			usernameLength = 39 // Maximum for GitHub
-			fmt.Println("Username length set to maximum of 39 for GitHub compatibility")
+		countStr := readLine("Number of usernames to generate (default 100): ")
+		usernameCount, err := strconv.Atoi(countStr)
+		if err != nil || usernameCount <= 0 {
+			usernameCount = 100
 		}
 
-		usernames = generateRandomGitHubUsernames(usernameCount, usernameLength)
-		fmt.Printf("Generated %d usernames of length %d\n", len(usernames), usernameLength)
+		lengthInput := readLine("Username length or range (e.g. 4 or 4-5, min 1, max 39): ")
+		minLength, maxLength := parseGitHubLengthRange(lengthInput)
+
+		usernames = generateRandomGitHubUsernames(usernameCount, minLength, maxLength)
+		if minLength == maxLength {
+			fmt.Printf("Generated %d usernames of length %d\n", len(usernames), minLength)
+		} else {
+			fmt.Printf("Generated %d usernames with length range %d-%d\n", len(usernames), minLength, maxLength)
+		}
 	} else {
 		// Ask for target file
-		fmt.Print("Enter target file path (default: data/names_to_check.txt): ")
-		var targetFile string
-		fmt.Scanln(&targetFile)
+		targetFile := readLine("Enter target file path (default: data/names_to_check.txt): ")
 		if targetFile == "" {
 			targetFile = "data/names_to_check.txt"
 		}
@@ -1189,37 +1193,60 @@ func runGitHubChecker() {
 		defer file.Close()
 
 		scanner := bufio.NewScanner(file)
+		skippedInvalid := 0
+		skippedReserved := 0
+		seenFile := make(map[string]bool)
+
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			if line != "" && !strings.HasPrefix(line, "#") {
+			// Strip leading @ handle indicator
+			line = strings.TrimPrefix(line, "@")
+			line = strings.ToLower(strings.TrimSpace(line))
+
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+				continue
+			}
+
+			if !isValidGitHubUsername(line) {
+				skippedInvalid++
+				continue
+			}
+
+			if isReservedGitHubUsername(line) {
+				skippedReserved++
+				continue
+			}
+
+			if !seenFile[line] {
+				seenFile[line] = true
 				usernames = append(usernames, line)
 			}
 		}
 
+		if skippedInvalid > 0 || skippedReserved > 0 {
+			fmt.Printf("Filtered out %d invalid format and %d reserved usernames to prevent false positives\n", skippedInvalid, skippedReserved)
+		}
+
 		if len(usernames) == 0 {
-			fmt.Println("No usernames found in file")
+			fmt.Println("No valid usernames found in file")
 			return
 		}
 
-		fmt.Printf("Loaded %d usernames from %s\n", len(usernames), targetFile)
+		fmt.Printf("Loaded %d valid usernames from %s\n", len(usernames), targetFile)
 	}
 
 	// Ask for worker count
-	fmt.Print("Worker count (default: 10): ")
-	var workers int
-	fmt.Scanln(&workers)
-	if workers <= 0 {
+	workersStr := readLine("Worker count (default: 10): ")
+	workers, err := strconv.Atoi(workersStr)
+	if err != nil || workers <= 0 {
 		workers = 10
 	}
 
 	// Ask for proxies
-	fmt.Print("Use proxies? (y/n): ")
-	var useProxies string
-	fmt.Scanln(&useProxies)
+	useProxies := readLine("Use proxies? (y/n): ")
 	var proxyFile string
 	if useProxies == "y" || useProxies == "Y" {
-		fmt.Print("Enter proxy file path (default: data/proxies.txt): ")
-		fmt.Scanln(&proxyFile)
+		proxyFile = readLine("Enter proxy file path (default: data/proxies.txt): ")
 		if proxyFile == "" {
 			proxyFile = "data/proxies.txt"
 		}
@@ -1227,7 +1254,6 @@ func runGitHubChecker() {
 
 	// Initialize rotator for proxies if needed
 	var rotator *httpclient.Rotator
-	var err error
 	if useProxies == "y" || useProxies == "Y" {
 		rotator, err = httpclient.NewRotator(proxyFile, "")
 		if err != nil {
@@ -1237,57 +1263,293 @@ func runGitHubChecker() {
 		fmt.Printf("Loaded %d proxies\n", rotator.ProxyCount())
 	}
 
+	// Ensure results directory exists once upfront
+	_ = os.MkdirAll("results", 0755)
+
+	// Ask for optional delay when not using proxies
+	var delay time.Duration
+	if useProxies != "y" && useProxies != "Y" {
+		delayStr := readLine("Delay per request in ms (default 0 for max speed): ")
+		delayMs, err := strconv.Atoi(delayStr)
+		if err == nil && delayMs > 0 {
+			delay = time.Duration(delayMs) * time.Millisecond
+		}
+	}
+
 	fmt.Println("\n=== Starting GitHub Username Check ===")
+	fmt.Println("Press Ctrl+C at any time to stop early and display results.")
+
+	// Setup graceful interrupt handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	stopChan := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+	}
+
+	interrupted := false
+	go func() {
+		<-sigChan
+		interrupted = true
+		fmt.Printf("\n%s[INFO]%s Stop requested (Ctrl+C). Finishing in-progress checks... (Press Ctrl+C again to force quit)\n", "\033[33m", "\033[0m")
+		stop()
+
+		// Allow second Ctrl+C to force exit
+		<-sigChan
+		fmt.Println("\nForce quitting...")
+		os.Exit(1)
+	}()
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	available := 0
 	taken := 0
 	errors := 0
-	semaphore := make(chan struct{}, workers)
+	var availableUsernames []string
+	jobChan := make(chan string, workers*4)
 
-	for _, username := range usernames {
+	// Start worker pool for maximum concurrency and reuse
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
-		go func(name string) {
+		go func() {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
+			for name := range jobChan {
+				availableCheck, err := checkGitHubUsername(name, githubToken, rotator)
 
-			availableCheck, err := checkGitHubUsername(name, githubToken, rotator)
+				mu.Lock()
+				if err != nil {
+					errors++
+					fmt.Printf("%s[ERROR]%s %s - %v\n", "\033[31m", "\033[0m", name, err)
+				} else if availableCheck {
+					available++
+					availableUsernames = append(availableUsernames, name)
+					fmt.Printf("%s[Available]%s %s\n", "\033[32m", "\033[0m", name)
+					// Save to results immediately
+					saveGitHubHit(name)
+				} else {
+					taken++
+					fmt.Printf("%s[Taken]%s %s\n", "\033[31m", "\033[0m", name)
+				}
+				mu.Unlock()
 
-			mu.Lock()
-			if err != nil {
-				errors++
-				fmt.Printf("[ERROR] %s - %v\n", name, err)
-			} else if availableCheck {
-				available++
-				fmt.Printf("[AVAILABLE] %s\n", name)
-				// Save to results
-				saveGitHubHit(name)
-			} else {
-				taken++
-				fmt.Printf("[TAKEN] %s\n", name)
+				if delay > 0 {
+					time.Sleep(delay)
+				}
 			}
-			mu.Unlock()
-
-			// Rate limiting - GitHub API allows 60 requests/hour without auth, 5000/hour with auth
-			time.Sleep(1 * time.Second)
-		}(username)
+		}()
 	}
+
+	checked := 0
+FEED_LOOP:
+	for _, username := range usernames {
+		select {
+		case <-stopChan:
+			break FEED_LOOP
+		case jobChan <- username:
+			checked++
+		}
+	}
+	close(jobChan)
 
 	wg.Wait()
 
 	fmt.Printf("\n=== Results ===\n")
-	fmt.Printf("Total: %d | Available: %d | Taken: %d | Errors: %d\n", len(usernames), available, taken, errors)
+	if interrupted {
+		fmt.Printf("%s(Stopped early with Ctrl+C)%s\n", "\033[33m", "\033[0m")
+	}
+	fmt.Printf("Checked: %d / %d | Available: %d | Taken: %d | Errors: %d\n", checked, len(usernames), available, taken, errors)
 	fmt.Printf("Available usernames saved to results/github_hits.txt\n")
+
+	if len(availableUsernames) > 0 {
+		fmt.Printf("\n=== Available Usernames (%d) ===\n", len(availableUsernames))
+		for i, name := range availableUsernames {
+			fmt.Printf("%d. %s%s%s\n", i+1, "\033[32m", name, "\033[0m")
+		}
+	} else {
+		fmt.Printf("\n=== Available Usernames (0) ===\n")
+		fmt.Println("No available usernames found.")
+	}
+}
+
+// githubReservedWords contains reserved words, system routes, and prohibited names on GitHub
+var githubReservedWords = map[string]struct{}{
+	"about": {}, "access": {}, "account": {}, "accounts": {}, "activate": {},
+	"activities": {}, "activity": {}, "ad": {}, "add": {}, "address": {},
+	"adm": {}, "admin": {}, "administration": {}, "administrator": {}, "advisories": {},
+	"affiliate": {}, "affiliates": {}, "ajax": {}, "all": {}, "alpha": {},
+	"analysis": {}, "analytics": {}, "android": {}, "anon": {}, "anonymous": {},
+	"api": {}, "app": {}, "apps": {}, "archive": {}, "archives": {},
+	"article": {}, "asct": {}, "asset": {}, "assets": {}, "atom": {},
+	"attributes": {}, "auth": {}, "authentication": {}, "avatar": {}, "backup": {},
+	"banner": {}, "banners": {}, "beta": {}, "billing": {}, "bin": {},
+	"blob": {}, "blog": {}, "blogs": {}, "board": {}, "book": {},
+	"bookmark": {}, "bot": {}, "bots": {}, "bounty": {}, "branches": {},
+	"brand": {}, "brands": {}, "bugs": {}, "business": {}, "businesses": {},
+	"cache": {}, "call": {}, "career": {}, "careers": {}, "case-studies": {},
+	"cart": {}, "categories": {}, "category": {}, "cdn": {}, "central": {},
+	"certification": {}, "cgi": {}, "changelog": {}, "chat": {}, "check": {},
+	"checkout": {}, "cla": {}, "client": {}, "clients": {}, "cloud": {},
+	"codereview": {}, "codespaces": {}, "collection": {}, "collections": {}, "comments": {},
+	"commit": {}, "commits": {}, "community": {}, "companies": {}, "compare": {},
+	"config": {}, "configuration": {}, "connect": {}, "contact": {}, "contact-us": {},
+	"contributing": {}, "cookbook": {}, "copilot": {}, "coupons": {}, "create": {},
+	"customer": {}, "customer-stories": {}, "customers": {}, "dashboard": {}, "dashboard-feed": {},
+	"dashboards": {}, "data": {}, "db": {}, "default": {}, "delete": {},
+	"demo": {}, "design": {}, "designer": {}, "destroy": {}, "dev": {},
+	"devel": {}, "develop": {}, "developer": {}, "developers": {}, "diagram": {},
+	"diary": {}, "dict": {}, "dictionary": {}, "diff": {}, "direct_messages": {},
+	"directory": {}, "discover": {}, "discussions": {}, "dist": {}, "doc": {},
+	"docs": {}, "documentation": {}, "download": {}, "downloads": {}, "downtime": {},
+	"draft": {}, "drafts": {}, "early-access": {}, "edit": {}, "editor": {},
+	"editors": {}, "edu": {}, "education": {}, "email": {}, "enterprise": {},
+	"enterprises": {}, "error": {}, "errors": {}, "events": {}, "explore": {},
+	"faq": {}, "favorites": {}, "featured": {}, "features": {}, "feed": {},
+	"feedback": {}, "feeds": {}, "file": {}, "files": {}, "find": {},
+	"first": {}, "fixtures": {}, "flash": {}, "fleet": {}, "fleets": {},
+	"forked": {}, "forum": {}, "forums": {}, "found": {}, "free": {},
+	"friend": {}, "friends": {}, "ftp": {}, "garage": {}, "gdpr": {},
+	"ghost": {}, "gist": {}, "gists": {}, "git": {}, "git-guides": {},
+	"git-lfs": {}, "github": {}, "github-copilot": {}, "graphql": {}, "graphs": {},
+	"group": {}, "groups": {}, "guest": {}, "guests": {}, "guide": {},
+	"guides": {}, "header": {}, "help": {}, "help-wanted": {}, "home": {},
+	"homepage": {}, "hooks": {}, "host": {}, "hosting": {}, "hostmaster": {},
+	"hostname": {}, "hovercards": {}, "howitworks": {}, "how-it-works": {}, "html": {},
+	"http": {}, "httpd": {}, "https": {}, "hub": {}, "ideas": {},
+	"identity": {}, "image": {}, "images": {}, "img": {}, "importer": {},
+	"inbox": {}, "index": {}, "individual": {}, "info": {}, "information": {},
+	"inquiry": {}, "insights": {}, "integration": {}, "integrations": {}, "interfaces": {},
+	"internal": {}, "introduction": {}, "invalid-email-address": {}, "investors": {}, "invitations": {},
+	"invite": {}, "ipad": {}, "iphone": {}, "irc": {}, "issue": {},
+	"issues": {}, "item": {}, "items": {}, "javascript": {}, "job": {},
+	"jobs": {}, "join": {}, "journal": {}, "journals": {}, "js": {},
+	"json": {}, "jump": {}, "knowledgebase": {}, "lab": {}, "labs": {},
+	"language": {}, "languages": {}, "launch": {}, "layout": {}, "layouts": {},
+	"leaderboard": {}, "learn": {}, "legal": {}, "library": {}, "license": {},
+	"licenses": {}, "link": {}, "links": {}, "linux": {}, "list": {},
+	"listings": {}, "lists": {}, "log": {}, "login": {}, "logos": {},
+	"logout": {}, "logs": {}, "mac": {}, "mail": {}, "mailer": {},
+	"mailing": {}, "maintenance": {}, "malware": {}, "man": {}, "manager": {},
+	"manual": {}, "map": {}, "maps": {}, "marketplace": {}, "master": {},
+	"mcp": {}, "media": {}, "member": {}, "members": {}, "mention": {},
+	"mentioned": {}, "mentioning": {}, "mentions": {}, "mercurial": {}, "message": {},
+	"messages": {}, "messenger": {}, "microblog": {}, "microblogs": {}, "migrating": {},
+	"milestones": {}, "mine": {}, "mirrors": {}, "mobile": {}, "movie": {},
+	"movies": {}, "mp3": {}, "msg": {}, "music": {}, "mx": {},
+	"my": {}, "name": {}, "named": {}, "navi": {}, "navigation": {},
+	"net": {}, "network": {}, "new": {}, "news": {}, "newsletter": {},
+	"newsroom": {}, "nick": {}, "nickname": {}, "nil": {}, "no-reply": {},
+	"nobody": {}, "node": {}, "none": {}, "nonprofit": {}, "nonprofits": {},
+	"notes": {}, "notices": {}, "notification": {}, "notifications": {}, "notify": {},
+	"ns": {}, "null": {}, "oauth": {}, "oauth_clients": {}, "offer": {},
+	"offers": {}, "official": {}, "old": {}, "online": {}, "open-source": {},
+	"openid": {}, "operator": {}, "order": {}, "orders": {}, "organisations": {},
+	"organization": {}, "organizations": {}, "orgs": {}, "overview": {}, "owner": {},
+	"owners": {}, "page": {}, "pages": {}, "paid": {}, "panel": {},
+	"partners": {}, "password": {}, "payment": {}, "payments": {}, "personal": {},
+	"photo": {}, "photos": {}, "php": {}, "pic": {}, "pics": {},
+	"ping": {}, "plan": {}, "plans": {}, "plugin": {}, "plugins": {},
+	"policy": {}, "pop": {}, "pop3": {}, "popular": {}, "popularity": {},
+	"portal": {}, "post": {}, "postfix": {}, "postmaster": {}, "posts": {},
+	"pr": {}, "premium": {}, "press": {}, "preview": {}, "price": {},
+	"pricing": {}, "privacy": {}, "privacy-policy": {}, "privacy_policy": {}, "profile": {},
+	"professional": {}, "project": {}, "projects": {}, "promo": {}, "pub": {},
+	"public": {}, "pulls": {}, "python": {}, "random": {}, "raw": {},
+	"read": {}, "readme": {}, "recent": {}, "recommendations": {}, "recruit": {},
+	"recruitment": {}, "redeem": {}, "register": {}, "registration": {}, "release": {},
+	"releases": {}, "remove": {}, "render": {}, "replies": {}, "reply": {},
+	"report": {}, "reports": {}, "repos": {}, "repositories": {}, "repository": {},
+	"req": {}, "request": {}, "requests": {}, "reset": {}, "resources": {},
+	"restore": {}, "revert": {}, "root": {}, "rss": {}, "ruby": {},
+	"rule": {}, "rules": {}, "save-net-neutrality": {}, "saved": {}, "scholar": {},
+	"scraping": {}, "script": {}, "scripts": {}, "search": {}, "secure": {},
+	"security": {}, "security_txt": {}, "self": {}, "send": {}, "server": {},
+	"server-info": {}, "server-status": {}, "service": {}, "services": {}, "session": {},
+	"sessions": {}, "setting": {}, "settings": {}, "setup": {}, "share": {},
+	"shareholders": {}, "shop": {}, "show": {}, "showcases": {}, "sign-in": {},
+	"sign-up": {}, "signin": {}, "signout": {}, "signup": {}, "site": {},
+	"site-policy": {}, "sitemap": {}, "sitemaps": {}, "sites": {}, "smtp": {},
+	"social-impact": {}, "socials": {}, "spam": {}, "spec": {}, "special": {},
+	"sponsor": {}, "sponsors": {}, "sponsorships": {}, "sql": {}, "src": {},
+	"ssh": {}, "ssl": {}, "staff": {}, "stage": {}, "staging": {},
+	"star": {}, "starred": {}, "stars": {}, "stat": {}, "static": {},
+	"statistics": {}, "stats": {}, "status": {}, "statuses": {}, "storage": {},
+	"store": {}, "stories": {}, "style": {}, "styleguide": {}, "styles": {},
+	"stylesheet": {}, "stylesheets": {}, "subdomain": {}, "subscribe": {}, "subscription": {},
+	"subscriptions": {}, "suggest": {}, "suggestion": {}, "suggestions": {}, "support": {},
+	"suspended": {}, "svn": {}, "sync": {}, "sys": {}, "sysadmin": {},
+	"system": {}, "tablet": {}, "tag": {}, "tags": {}, "talks": {},
+	"teach": {}, "teacher": {}, "teachers": {}, "teaching": {}, "team": {},
+	"teams": {}, "tech": {}, "telnet": {}, "ten": {}, "term": {},
+	"terms": {}, "terms-of-service": {}, "terms_of_service": {}, "test": {}, "theme": {},
+	"themes": {}, "timeline": {}, "tmp": {}, "todo": {}, "tool": {},
+	"tools": {}, "top": {}, "topic": {}, "topics": {}, "tos": {},
+	"tour": {}, "train": {}, "training": {}, "translations": {}, "tree": {},
+	"trending": {}, "trends": {}, "tutorial": {}, "tux": {}, "tv": {},
+	"twitter": {}, "undef": {}, "undefined": {}, "unfollow": {}, "unsubscribe": {},
+	"update": {}, "updates": {}, "upload": {}, "uploads": {}, "url": {},
+	"usage": {}, "user": {}, "user-attachments": {}, "username": {}, "users": {},
+	"version": {}, "video": {}, "videos": {}, "visitor": {}, "visualization": {},
+	"voice": {}, "watch": {}, "watching": {}, "weather": {}, "web": {},
+	"webhook": {}, "webhooks": {}, "webmail": {}, "webmaster": {}, "website": {},
+	"websites": {}, "welcome": {}, "widget": {}, "widgets": {}, "why-github": {},
+	"wiki": {}, "wikis": {}, "win": {}, "windows": {}, "word": {},
+	"work": {}, "works": {}, "works-with": {}, "workshop": {}, "ww": {},
+	"www": {}, "www0": {}, "www1": {}, "www2": {}, "www3": {},
+	"www4": {}, "www5": {}, "www6": {}, "www7": {}, "www8": {},
+	"www9": {}, "xml": {}, "xmpp": {}, "xxx": {}, "yaml": {},
+	"year": {}, "yml": {}, "you": {},
+}
+
+// isReservedGitHubUsername checks if a username is in GitHub's reserved words list
+func isReservedGitHubUsername(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if _, exists := githubReservedWords[name]; exists {
+		return true
+	}
+
+	// HTTP status codes 100-599 are reserved system paths
+	if len(name) == 3 {
+		if code, err := strconv.Atoi(name); err == nil && code >= 100 && code <= 599 {
+			return true
+		}
+	}
+
+	// GitHub reserved prefixes / extensions
+	if strings.HasPrefix(name, "gh-") || strings.HasPrefix(name, "github-") || strings.HasPrefix(name, "www") {
+		return true
+	}
+	if strings.HasSuffix(name, ".git") || strings.HasSuffix(name, ".json") {
+		return true
+	}
+
+	return false
 }
 
 // checkGitHubUsername checks if a GitHub username is available
 func checkGitHubUsername(username, token string, rotator *httpclient.Rotator) (bool, error) {
+	username = strings.ToLower(strings.TrimSpace(username))
+
+	// Fast pre-filter: syntax and reserved names check
+	if !isValidGitHubUsername(username) {
+		return false, nil // Invalid format cannot be available
+	}
+	if isReservedGitHubUsername(username) {
+		return false, nil // Reserved words cannot be registered
+	}
+
 	// GitHub API endpoint for user lookup
 	url := fmt.Sprintf("https://api.github.com/users/%s", username)
 
-	req, err := http.NewRequest("GET", url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	// Use HEAD request to eliminate response body transfer overhead (latency & bandwidth reduction)
+	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
 	if err != nil {
 		return false, err
 	}
@@ -1301,16 +1563,14 @@ func checkGitHubUsername(username, token string, rotator *httpclient.Rotator) (b
 
 	var client *http.Client
 	if rotator != nil {
-		clientStr, proxy, err := rotator.GetClientWithProxy()
+		clientStr, _, err := rotator.GetClientWithProxy()
 		if err != nil {
 			return false, err
 		}
 		client = clientStr
-		if proxy != "" {
-			fmt.Printf("Using proxy: %s\n", proxy)
-		}
 	} else {
-		client = &http.Client{Timeout: 10 * time.Second}
+		// Use shared high-performance client with HTTP/2 and aggressive connection pooling
+		client = httpclient.GetClient()
 	}
 
 	resp, err := client.Do(req)
@@ -1318,8 +1578,21 @@ func checkGitHubUsername(username, token string, rotator *httpclient.Rotator) (b
 		return false, err
 	}
 	defer resp.Body.Close()
+	// Drain body so Go's Transport can reuse the connection for Keep-Alive / HTTP/2
+	io.Copy(io.Discard, resp.Body)
 
-	// If we get 404, the username is available
+	// CRITICAL FALSE POSITIVE FILTER: Verify the response actually came from GitHub
+	// Dead or rogue proxies often return a 404 HTML error page from squid/nginx/cloudflare.
+	// Real GitHub API responses always include GitHub headers.
+	isGitHubResponse := resp.Header.Get("X-GitHub-Request-Id") != "" ||
+		resp.Header.Get("X-GitHub-Media-Type") != "" ||
+		strings.Contains(strings.ToLower(resp.Header.Get("Server")), "github")
+
+	if !isGitHubResponse {
+		return false, fmt.Errorf("proxy error: response did not originate from GitHub (fake 404 prevented)")
+	}
+
+	// If we get 404 with verified GitHub headers, the username is available
 	if resp.StatusCode == 404 {
 		return true, nil
 	}
@@ -1330,8 +1603,8 @@ func checkGitHubUsername(username, token string, rotator *httpclient.Rotator) (b
 	}
 
 	// Handle rate limiting
-	if resp.StatusCode == 403 {
-		return false, fmt.Errorf("rate limited (403 Forbidden)")
+	if resp.StatusCode == 403 || resp.StatusCode == 429 {
+		return false, fmt.Errorf("rate limited (HTTP %d)", resp.StatusCode)
 	}
 
 	return false, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
@@ -1339,10 +1612,6 @@ func checkGitHubUsername(username, token string, rotator *httpclient.Rotator) (b
 
 // saveGitHubHit saves an available GitHub username to results/github_hits.txt
 func saveGitHubHit(username string) error {
-	if err := os.MkdirAll("results", 0755); err != nil {
-		return err
-	}
-
 	file, err := os.OpenFile("results/github_hits.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -1353,31 +1622,143 @@ func saveGitHubHit(username string) error {
 	return err
 }
 
-// generateRandomGitHubUsernames generates random GitHub usernames of specified length
-func generateRandomGitHubUsernames(count, length int) []string {
+// parseGitHubLengthRange parses a single length (e.g. "4") or a range (e.g. "4-5", "4:5", "4 to 5")
+func parseGitHubLengthRange(input string) (int, int) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return 4, 4 // default length
+	}
+
+	// Normalize separators to "-"
+	normalized := strings.ReplaceAll(input, "to", "-")
+	normalized = strings.ReplaceAll(normalized, "..", "-")
+	normalized = strings.ReplaceAll(normalized, ":", "-")
+	normalized = strings.ReplaceAll(normalized, ",", "-")
+
+	var minLen, maxLen int
+
+	if strings.Contains(normalized, "-") {
+		parts := strings.Split(normalized, "-")
+		if len(parts) >= 2 {
+			p1 := strings.TrimSpace(parts[0])
+			p2 := strings.TrimSpace(parts[1])
+			v1, err1 := strconv.Atoi(p1)
+			v2, err2 := strconv.Atoi(p2)
+			if err1 == nil && err2 == nil {
+				minLen = v1
+				maxLen = v2
+			} else if err1 == nil {
+				minLen = v1
+				maxLen = v1
+			} else if err2 == nil {
+				minLen = v2
+				maxLen = v2
+			} else {
+				minLen = 4
+				maxLen = 4
+			}
+		}
+	} else if fields := strings.Fields(input); len(fields) == 2 {
+		v1, err1 := strconv.Atoi(fields[0])
+		v2, err2 := strconv.Atoi(fields[1])
+		if err1 == nil && err2 == nil {
+			minLen = v1
+			maxLen = v2
+		} else {
+			minLen = 4
+			maxLen = 4
+		}
+	} else {
+		val, err := strconv.Atoi(input)
+		if err != nil {
+			fmt.Printf("Invalid length '%s', defaulting to 4\n", input)
+			return 4, 4
+		}
+		minLen = val
+		maxLen = val
+	}
+
+	// Swap if min > max
+	if minLen > maxLen {
+		minLen, maxLen = maxLen, minLen
+	}
+
+	// Clamp to GitHub specifications (1-39 characters)
+	if minLen < 1 {
+		minLen = 1
+		fmt.Println("Minimum length set to 1 for GitHub compatibility")
+	}
+	if maxLen > 39 {
+		maxLen = 39
+		fmt.Println("Maximum length set to 39 for GitHub compatibility")
+	}
+	if maxLen < 1 {
+		maxLen = 1
+	}
+	if minLen > 39 {
+		minLen = 39
+	}
+	if minLen > maxLen {
+		minLen, maxLen = maxLen, minLen
+	}
+
+	return minLen, maxLen
+}
+
+// generateRandomGitHubUsernames generates random GitHub usernames within the specified length range
+func generateRandomGitHubUsernames(count, minLength, maxLength int) []string {
+	alphaNum := "abcdefghijklmnopqrstuvwxyz0123456789"
 	charset := "abcdefghijklmnopqrstuvwxyz0123456789-"
 
+	if minLength < 1 {
+		minLength = 1
+	}
+	if maxLength > 39 {
+		maxLength = 39
+	}
+	if minLength > maxLength {
+		minLength, maxLength = maxLength, minLength
+	}
+
 	usernames := make([]string, 0, count)
+	seen := make(map[string]bool)
 	attempts := 0
-	maxAttempts := count * 10
+	maxAttempts := count * 30
+	if maxAttempts < 100 {
+		maxAttempts = 100
+	}
 
 	for len(usernames) < count && attempts < maxAttempts {
 		attempts++
 
+		length := minLength
+		if maxLength > minLength {
+			length = minLength + rand.Intn(maxLength-minLength+1)
+		}
+
 		username := make([]byte, length)
-		for j := 0; j < length; j++ {
-			username[j] = charset[rand.Intn(len(charset))]
+		if length == 1 {
+			// GitHub 1-character username cannot be a hyphen
+			username[0] = alphaNum[rand.Intn(len(alphaNum))]
+		} else {
+			// GitHub usernames cannot start or end with a hyphen
+			username[0] = alphaNum[rand.Intn(len(alphaNum))]
+			username[length-1] = alphaNum[rand.Intn(len(alphaNum))]
+			for j := 1; j < length-1; j++ {
+				username[j] = charset[rand.Intn(len(charset))]
+			}
 		}
 
 		usernameStr := string(username)
 
-		if isValidGitHubUsername(usernameStr) {
+		if isValidGitHubUsername(usernameStr) && !isReservedGitHubUsername(usernameStr) && !seen[usernameStr] {
+			seen[usernameStr] = true
 			usernames = append(usernames, usernameStr)
 		}
 	}
 
 	if len(usernames) < count {
-		fmt.Printf("Warning: Only generated %d valid usernames out of %d requested\n", len(usernames), count)
+		fmt.Printf("Warning: Only generated %d valid unique usernames out of %d requested\n", len(usernames), count)
 	}
 
 	return usernames

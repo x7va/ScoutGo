@@ -54,7 +54,7 @@ func NewRotator(proxyFile, tokenFile string) (*Rotator, error) {
 		tokenIdx:         0,
 		clientCache:      make(map[string]*http.Client),
 		proxyFailures:    make(map[string]int),
-		failureThreshold: 3, // Disable proxy after 3 failures
+		failureThreshold: 10, // Disable proxy after 10 failures (was 3 - too aggressive)
 		proxyCooldowns:   make(map[string]time.Time),
 		activeRateLimits: make(map[string]RateLimitInfo),
 		timerRunning:     false,
@@ -507,7 +507,7 @@ func (r *Rotator) StartTimerManager() {
 						r.rateLimitMu.Lock()
 						delete(r.activeRateLimits, id)
 						r.rateLimitMu.Unlock()
-						fmt.Printf("%s[RATELIMIT] @%s cooldown complete%s\n", "\033[33m", info.Target, "\033[0m")
+						fmt.Printf("%s[RATELIMIT] %s cooldown complete%s\n", "\033[33m", info.Proxy, "\033[0m")
 					}
 				}
 			case <-r.timerStopChan:
